@@ -1,25 +1,22 @@
 const express = require('express');
 const axios = require('axios');
-const cheerio = require('cheerio');
 const cors = require('cors');
 
 const app = express();
 app.use(cors());
 
-// --------------------------------------------------------
-// FUNZIONI DI SUPPORTO E BYPASS SICUREZZA
-// --------------------------------------------------------
-
+// Headers standard per sembrare un'app legittima
 const defaultHeaders = { 
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, come Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Cache-Control': 'no-cache'
+    'Connection': 'keep-alive'
 };
 
+// Pulisce qualsiasi formato valuta in un numero pulito
 function parseEuroPrice(text) {
     if (!text) return NaN;
-    let cleaned = text.replace(/[^0-9,.]/g, '');
+    let cleaned = text.toString().replace(/[^0-9,.]/g, '');
     if (cleaned.includes('.') && cleaned.includes(',')) {
         if (cleaned.lastIndexOf(',') > cleaned.lastIndexOf('.')) {
             cleaned = cleaned.replace(/\./g, '').replace(',', '.');
@@ -32,163 +29,85 @@ function parseEuroPrice(text) {
     return parseFloat(cleaned);
 }
 
-function extractPriceRegex(html) {
-    if (!html) return null;
-    const match = html.match(/"(?:lastPrice|price|regularMarketPrice|ask|nav|close|Prezzo)"\s*[:=]\s*"?(\d+(?:\.\d+)?)/i);
-    if (match && match[1]) {
-        return parseFloat(match[1]);
-    }
-    return null;
-}
-
-// IL NUOVO SISTEMA ANTI-CLOUDFLARE: Rotazione Proxy Infallibile
-async function fetchHtml(targetUrl) {
-    const proxies = [
-        targetUrl, // 1. Tentativo Diretto
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`, // 2. Proxy AllOrigins
-        `https://corsproxy.io/?${encodeURIComponent(targetUrl)}` // 3. Proxy CorsProxy
-    ];
-
-    for (let url of proxies) {
-        try {
-            const res = await axios.get(url, { headers: defaultHeaders, timeout: 8000 });
-            const html = res.data;
-            
-            // Controlliamo se ci hanno mandato una pagina di blocco Anti-Bot. Se sì, scartiamola e usiamo il prossimo proxy.
-            if (typeof html === 'string') {
-                if (html.includes('Just a moment...') || 
-                    html.includes('Enable JavaScript and cookies to continue') ||
-                    (html.includes('Cloudflare') && html.includes('captcha'))) {
-                    continue; 
-                }
-                return html; // Abbiamo ottenuto la pagina vera!
-            }
-        } catch (err) {
-            // Se c'è un errore (es. 403 Forbidden), passiamo silenziosamente al prossimo proxy
-            continue; 
-        }
-    }
-    return null; // Tutti i tentativi hanno fallito
-}
-
-async function getYahooPrice(ticker) {
-    try {
-        const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1d`;
-        const { data } = await axios.get(yUrl, { headers: defaultHeaders, timeout: 5000 });
-        if (data.chart.result && data.chart.result.length > 0) {
-            return data.chart.result[0].meta.regularMarketPrice;
-        }
-    } catch(e) {}
-    return null;
-}
-
-// --------------------------------------------------------
-// ROTTA PRINCIPALE API
-// --------------------------------------------------------
-
 app.get('/api/price', async (req, res) => {
     const { ticker, isin } = req.query;
     let logs = []; 
 
+    // 1. YAHOO TRAMITE TICKER
     if (ticker) {
-        const price = await getYahooPrice(ticker);
-        if (price) return res.json({ price, source: 'Yahoo Finance (Ticker)' });
-        logs.push(`Ticker non trovato su Yahoo: ${ticker}`);
+        try {
+            const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1d`;
+            const { data } = await axios.get(yUrl, { headers: defaultHeaders, timeout: 5000 });
+            if (data.chart.result && data.chart.result.length > 0) {
+                const price = data.chart.result[0].meta.regularMarketPrice;
+                if (price) return res.json({ price, source: 'Yahoo Finance (Ticker)' });
+            }
+        } catch(e) { logs.push('Yahoo Ticker fallito'); }
     }
 
     if (isin) {
         const cleanIsin = isin.trim().toUpperCase();
 
+        // 2A. YAHOO SEARCH (Traduzione ISIN)
         try {
             const searchUrl = `https://query2.finance.yahoo.com/v1/finance/search?q=${cleanIsin}`;
             const searchRes = await axios.get(searchUrl, { headers: defaultHeaders, timeout: 5000 });
             if (searchRes.data.quotes && searchRes.data.quotes.length > 0) {
                 const validQuote = searchRes.data.quotes.find(q => q.quoteType === 'EQUITY' || q.quoteType === 'ETF' || q.quoteType === 'MUTUALFUND') || searchRes.data.quotes[0];
                 if (validQuote && validQuote.symbol) {
-                    const price = await getYahooPrice(validQuote.symbol);
-                    if (price) return res.json({ price, source: `Yahoo Finance (${validQuote.symbol})` });
+                    const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(validQuote.symbol)}?interval=1d&range=1d`;
+                    const yRes = await axios.get(yUrl, { headers: defaultHeaders, timeout: 5000 });
+                    if (yRes.data.chart.result && yRes.data.chart.result.length > 0) {
+                        const price = yRes.data.chart.result[0].meta.regularMarketPrice;
+                        if (price) return res.json({ price, source: `Yahoo Finance (${validQuote.symbol})` });
+                    }
                 }
             }
-        } catch (e) {
-            logs.push('Traduzione Yahoo ISIN fallita');
-        }
+        } catch (e) { logs.push('Yahoo ISIN fallito'); }
 
+        // 2B. FINANCIAL TIMES API (Il Re dei BTP, Fondi Comuni e ETF Europei)
         try {
-            const html = await fetchHtml(`https://www.justetf.com/it/etf-profile.html?isin=${cleanIsin}`);
-            if (html) {
-                const $ = cheerio.load(html);
-                let priceText = $('.val span').first().text() || $('.infobox .val').first().text() || $('div[class*="val"] span').first().text();
-                let price = parseEuroPrice(priceText);
-                
-                if (!isNaN(price) && price > 0) return res.json({ price, source: 'JustETF (HTML)' });
-
-                price = extractPriceRegex(html);
-                if (price) return res.json({ price, source: 'JustETF (Codice Nascosto)' });
+            const ftSearchUrl = `https://markets.ft.com/data/searchapi/search?query=${cleanIsin}`;
+            const ftSearchRes = await axios.get(ftSearchUrl, { headers: defaultHeaders, timeout: 5000 });
+            if (ftSearchRes.data && ftSearchRes.data.data && ftSearchRes.data.data.searchResults && ftSearchRes.data.data.searchResults.length > 0) {
+                const ftSymbol = ftSearchRes.data.data.searchResults[0].symbol;
+                const ftQuoteUrl = `https://markets.ft.com/data/extapi/quotes?symbols=${ftSymbol}`;
+                const ftQuoteRes = await axios.get(ftQuoteUrl, { headers: defaultHeaders, timeout: 5000 });
+                if (ftQuoteRes.data && ftQuoteRes.data.length > 0) {
+                    const price = ftQuoteRes.data[0].lastPrice;
+                    if (price) return res.json({ price: parseFloat(price), source: 'Financial Times API' });
+                }
             }
-            logs.push('Prezzo non trovato su JustETF (Blocco Anti-Bot in corso)');
-        } catch(e) { logs.push('JustETF fallito'); }
+        } catch(e) { logs.push('Financial Times fallito'); }
 
+        // 2C. TRADEGATE EXCHANGE (Perfetto per Certificati Vontobel e Azioni Miste)
         try {
-            const html = await fetchHtml(`https://www.borsaitaliana.it/borsa/ricerca/dettaglio.html?isin=${cleanIsin}`);
-            if (html) {
-                const $ = cheerio.load(html);
-                let priceText = $('.summary-value').first().text() || 
-                                $('span.-block._dow').first().text() ||
-                                $('span.t-text-right').first().text() ||
-                                $('.m-box-titolo-dettaglio-prezzo').first().text() ||
-                                $('strong.t-text-3xl').first().text();
-                let price = parseEuroPrice(priceText);
-                
-                if (!isNaN(price) && price > 0) return res.json({ price, source: 'Borsa Italiana (HTML)' });
-
-                price = extractPriceRegex(html);
-                if (price) return res.json({ price, source: 'Borsa Italiana (Codice Nascosto)' });
+            // Sito della borsa tedesca privo di Cloudflare
+            const tgUrl = `https://www.tradegate.de/refresh.php?isin=${cleanIsin}`;
+            const tgRes = await axios.get(tgUrl, { headers: defaultHeaders, timeout: 5000 });
+            const match = tgRes.data.match(/<td id="last">([\d,.]+)<\/td>/i);
+            if (match && match[1]) {
+                const price = parseEuroPrice(match[1]);
+                if (!isNaN(price) && price > 0) return res.json({ price, source: 'Tradegate Exchange' });
             }
-            logs.push('Prezzo non trovato su Borsa Italiana (Blocco Anti-Bot in corso)');
-        } catch(e) { logs.push('Borsa Italiana fallita'); }
+        } catch(e) { logs.push('Tradegate fallito'); }
 
+        // 2D. IL SOLE 24 ORE API (Borsa Italiana Pura)
         try {
-            const html = await fetchHtml(`https://www.teleborsa.it/Quotazioni/Ricerca?q=${cleanIsin}`);
-            if (html) {
-                const $ = cheerio.load(html);
-                let priceText = $('span.t-text-3xl').first().text() || 
-                                $('span[class*="text-3xl"]').first().text() ||
-                                $('span.t-text-2xl').first().text() ||
-                                $('.m-box-titolo-dettaglio-prezzo').first().text();
-                let price = parseEuroPrice(priceText);
-                
-                if (!isNaN(price) && price > 0) return res.json({ price, source: 'Teleborsa (HTML)' });
-
-                price = extractPriceRegex(html);
-                if (price) return res.json({ price, source: 'Teleborsa (Codice Nascosto)' });
+            const soleUrl = `https://mercati.ilsole24ore.com/api/proxy/dati/strumento?isin=${cleanIsin}`;
+            const soleRes = await axios.get(soleUrl, { headers: defaultHeaders, timeout: 5000 });
+            if (soleRes.data && soleRes.data.Prezzo) {
+                const price = parseEuroPrice(soleRes.data.Prezzo);
+                if (!isNaN(price) && price > 0) return res.json({ price, source: 'Il Sole 24 Ore API' });
             }
-            logs.push('Prezzo non trovato su Teleborsa (Blocco Anti-Bot in corso)');
-        } catch(e) { logs.push('Teleborsa fallita'); }
-        
-        try {
-            const html = await fetchHtml(`https://markets.vontobel.com/it-it/prodotti/ricerca?query=${cleanIsin}`);
-            if (html) {
-                const $ = cheerio.load(html);
-                let priceText = $('.ask-price').first().text() || 
-                                $('.price-value').first().text() || 
-                                $('td.ask span.value').first().text() ||
-                                $('td[data-col="ask"]').first().text() ||
-                                $('.product-price').first().text();
-                let price = parseEuroPrice(priceText);
-                
-                if (!isNaN(price) && price > 0) return res.json({ price, source: 'Markets Vontobel (HTML)' });
-
-                price = extractPriceRegex(html);
-                if (price) return res.json({ price, source: 'Markets Vontobel (Codice Nascosto)' });
-            }
-            logs.push('Prezzo non trovato su Vontobel');
-        } catch(e) { logs.push('Vontobel fallita'); }
+        } catch(e) { logs.push('Sole 24 Ore fallito'); }
     }
 
-    res.status(404).json({ error: 'Prezzo non trovato con nessun metodo', logs });
+    // Se arriviamo qui... l'asset è davvero introvabile!
+    res.status(404).json({ error: 'Prezzo non trovato nei database', logs });
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-    console.log(`Server API & Scraping in ascolto sulla porta ${PORT}`);
+    console.log(`Server API Attivo sulla porta ${PORT}`);
 });
