@@ -19,21 +19,24 @@ async function getYahooPrice(ticker, headers) {
 
 app.get('/api/price', async (req, res) => {
     const { ticker, isin } = req.query;
+    let logs = []; // Teniamo traccia di cosa succede
 
-    // Headers standard per simulare un browser reale
+    // Headers per simulare un vero browser
     const headers = { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/json,application/xhtml+xml',
-        'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Cache-Control': 'no-cache'
     };
 
-    // 1. TENTATIVO DIRETTO: YAHOO FINANCE (Se hai inserito il Ticker a mano)
+    // 1. TENTATIVO DIRETTO: YAHOO FINANCE (Se hai inserito il Ticker)
     if (ticker) {
         try {
             const price = await getYahooPrice(ticker, headers);
             if (price) return res.json({ price, source: 'Yahoo Finance (Ticker)' });
+            logs.push(`Yahoo (Ticker): Prezzo non trovato per ${ticker}`);
         } catch (e) {
-            console.log(`Yahoo API fallito per ticker: ${ticker}`);
+            logs.push(`Yahoo (Ticker) fallito: ${e.message}`);
         }
     }
 
@@ -41,58 +44,97 @@ app.get('/api/price', async (req, res) => {
     if (isin) {
         const cleanIsin = isin.trim().toUpperCase();
 
-        // 2A. Traduzione ISIN in Ticker (Trucchetto infallibile per Azioni Italiane come ENI)
+        // 2A. TRADUZIONE ISIN -> TICKER YAHOO (Ottimo per Azioni normali)
         try {
             const searchUrl = `https://query2.finance.yahoo.com/v1/finance/search?q=${cleanIsin}`;
             const searchRes = await axios.get(searchUrl, { headers, timeout: 5000 });
             if (searchRes.data.quotes && searchRes.data.quotes.length > 0) {
-                // Prende il primo Ticker trovato corrispondente a quell'ISIN
-                const foundTicker = searchRes.data.quotes[0].symbol;
-                const price = await getYahooPrice(foundTicker, headers);
-                if (price) return res.json({ price, source: `Yahoo Finance (Via ISIN: ${foundTicker})` });
+                const validQuote = searchRes.data.quotes.find(q => q.quoteType === 'EQUITY' || q.quoteType === 'ETF') || searchRes.data.quotes[0];
+                if (validQuote && validQuote.symbol) {
+                    const price = await getYahooPrice(validQuote.symbol, headers);
+                    if (price) return res.json({ price, source: `Yahoo Finance (Convertito da ISIN: ${validQuote.symbol})` });
+                }
             }
+            logs.push(`Yahoo (ISIN): Nessun ticker associato trovato`);
         } catch (e) {
-            console.log(`Ricerca Yahoo fallita per ISIN: ${cleanIsin}`);
+            logs.push(`Yahoo (ISIN) fallito: ${e.message}`);
         }
 
-        // 2B. TENTATIVO TELEBORSA (Raccoglie Borsa Italiana, BTP e Certificati Vontobel)
+        // 2B. BORSA ITALIANA (BTP, BOT, Azioni ITA)
         try {
-            const tUrl = `https://www.teleborsa.it/Quotazioni/Ricerca?q=${cleanIsin}`;
-            const { data } = await axios.get(tUrl, { headers, timeout: 8000 });
+            const bUrl = `https://www.borsaitaliana.it/borsa/ricerca/dettaglio.html?isin=${cleanIsin}`;
+            const { data } = await axios.get(bUrl, { headers, timeout: 8000 });
             const $ = cheerio.load(data);
             
-            // Cerchiamo le classi CSS dove Teleborsa posiziona i prezzi
-            let priceText = $('span.t-text-3xl').first().text().trim() || 
-                            $('span.t-text-2xl').first().text().trim() ||
-                            $('.m-box-titolo-dettaglio-prezzo').first().text().trim();
+            let priceText = $('.summary-value').first().text() || 
+                            $('span.-block._dow').first().text() ||
+                            $('span.t-text-right').first().text() ||
+                            $('.m-box-titolo-dettaglio-prezzo').first().text();
             
-            if (priceText) {
-                // Pulisce il formato europeo "1.234,56 €" in "1234.56"
-                priceText = priceText.replace('€', '').replace(/\./g, '').replace(',', '.').trim();
+            if (priceText && priceText.trim() !== '') {
+                priceText = priceText.replace(/EUR/ig, '').replace(/€/g, '').replace(/\./g, '').replace(',', '.').trim();
                 const price = parseFloat(priceText);
-                if (!isNaN(price) && price > 0) return res.json({ price, source: 'Teleborsa' });
+                if (!isNaN(price) && price > 0) return res.json({ price, source: 'Borsa Italiana' });
+            } else {
+                logs.push(`Borsa Italiana: Prezzo non trovato nel codice HTML della pagina`);
             }
         } catch(e) {
-            console.log(`Teleborsa fallito per ISIN: ${cleanIsin}`);
+            logs.push(`Borsa Italiana fallita: ${e.message}`);
         }
 
-        // 2C. TENTATIVO JUSTETF (Il migliore per gli ETF non coperti da Yahoo)
+        // 2C. MARKETS VONTOBEL (Certificati)
+        try {
+            const vUrl = `https://markets.vontobel.com/it-it/prodotti/ricerca?query=${cleanIsin}`;
+            const { data } = await axios.get(vUrl, { headers, timeout: 8000 });
+            const $ = cheerio.load(data);
+            
+            let priceText = $('.ask-price').first().text() || 
+                            $('.price-value').first().text() || 
+                            $('td[data-col="ask"]').first().text();
+
+            if (priceText && priceText.trim() !== '') {
+                priceText = priceText.replace(/EUR/ig, '').replace(/€/g, '').replace(/\./g, '').replace(',', '.').trim();
+                const price = parseFloat(priceText);
+                if (!isNaN(price) && price > 0) return res.json({ price, source: 'Markets Vontobel' });
+            } else {
+                logs.push(`Vontobel: Prezzo non trovato nel codice HTML della pagina`);
+            }
+        } catch(e) {
+            logs.push(`Vontobel fallita: ${e.message}`);
+        }
+
+        // 2D. JUSTETF (Con sistema anti-blocco Proxy Fallback)
         try {
             const jUrl = `https://www.justetf.com/it/etf-profile.html?isin=${cleanIsin}`;
-            const { data } = await axios.get(jUrl, { headers, timeout: 8000 });
-            const $ = cheerio.load(data);
+            let response = await axios.get(jUrl, { headers, timeout: 8000 }).catch(() => null);
             
-            const priceText = $('.val span').first().text().trim().replace(',', '.');
-            const price = parseFloat(priceText);
-            
-            if (!isNaN(price) && price > 0) return res.json({ price, source: 'JustETF' });
+            // Se JustETF ci blocca (403 Forbidden), passiamo da un proxy pubblico!
+            if (!response || response.status === 403) {
+                logs.push(`JustETF ha bloccato la richiesta diretta. Provo con il Proxy...`);
+                const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(jUrl)}`;
+                const proxyRes = await axios.get(proxyUrl, { headers, timeout: 10000 });
+                if (proxyRes.data && proxyRes.data.contents) {
+                    response = { data: proxyRes.data.contents };
+                }
+            }
+
+            if (response && response.data) {
+                const $ = cheerio.load(response.data);
+                const priceText = $('.val span').first().text();
+                if (priceText && priceText.trim() !== '') {
+                    const price = parseFloat(priceText.replace(',', '.'));
+                    if (!isNaN(price) && price > 0) return res.json({ price, source: 'JustETF' });
+                } else {
+                    logs.push(`JustETF: Prezzo non trovato nel codice HTML della pagina`);
+                }
+            }
         } catch(e) {
-            console.log(`JustETF fallito per ISIN: ${cleanIsin}`);
+            logs.push(`JustETF fallita: ${e.message}`);
         }
     }
 
-    // Se tutti i 4 tentativi falliscono, restituisce errore
-    res.status(404).json({ error: 'Prezzo non trovato con nessun metodo' });
+    // Niente ha funzionato, restituisci l'errore e tutti i log per capire cosa è andato storto
+    res.status(404).json({ error: 'Prezzo non trovato', logs });
 });
 
 const PORT = process.env.PORT || 3001;
