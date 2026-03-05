@@ -10,14 +10,13 @@ app.use(cors());
 // FUNZIONI DI SUPPORTO E BYPASS SICUREZZA
 // --------------------------------------------------------
 
-// Headers globali per simulare un browser reale (FONDAMENTALE per non farsi bloccare da Yahoo e altri)
 const defaultHeaders = { 
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7'
+    'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Cache-Control': 'no-cache'
 };
 
-// Pulisce testi complessi (es. "€ 1.234,56", "1,234.56 EUR") in numero puro (1234.56)
 function parseEuroPrice(text) {
     if (!text) return NaN;
     let cleaned = text.replace(/[^0-9,.]/g, '');
@@ -33,37 +32,45 @@ function parseEuroPrice(text) {
     return parseFloat(cleaned);
 }
 
-// "Il Segugio": Cerca valori numerici nascosti nel codice sorgente Javascript (JSON)
 function extractPriceRegex(html) {
     if (!html) return null;
-    // Cerca pattern comuni usati dalle API interne dei siti (es. "lastPrice":12.34, "price":12.34)
-    const match = html.match(/"(?:lastPrice|price|regularMarketPrice|ask|nav|close)"\s*:\s*(\d+(?:\.\d+)?)/i);
+    const match = html.match(/"(?:lastPrice|price|regularMarketPrice|ask|nav|close|Prezzo)"\s*[:=]\s*"?(\d+(?:\.\d+)?)/i);
     if (match && match[1]) {
         return parseFloat(match[1]);
     }
     return null;
 }
 
-// Funzione infallibile che prova la via diretta, e se bloccata usa un proxy
+// IL NUOVO SISTEMA ANTI-CLOUDFLARE: Rotazione Proxy Infallibile
 async function fetchHtml(targetUrl) {
-    try {
-        const res = await axios.get(targetUrl, { headers: defaultHeaders, timeout: 6000 });
-        return res.data;
-    } catch (err) {
+    const proxies = [
+        targetUrl, // 1. Tentativo Diretto
+        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`, // 2. Proxy AllOrigins
+        `https://corsproxy.io/?${encodeURIComponent(targetUrl)}` // 3. Proxy CorsProxy
+    ];
+
+    for (let url of proxies) {
         try {
-            const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
-            const proxyRes = await axios.get(proxyUrl, { headers: defaultHeaders, timeout: 8000 });
-            if (proxyRes.data && proxyRes.data.contents) {
-                return proxyRes.data.contents;
+            const res = await axios.get(url, { headers: defaultHeaders, timeout: 8000 });
+            const html = res.data;
+            
+            // Controlliamo se ci hanno mandato una pagina di blocco Anti-Bot. Se sì, scartiamola e usiamo il prossimo proxy.
+            if (typeof html === 'string') {
+                if (html.includes('Just a moment...') || 
+                    html.includes('Enable JavaScript and cookies to continue') ||
+                    (html.includes('Cloudflare') && html.includes('captcha'))) {
+                    continue; 
+                }
+                return html; // Abbiamo ottenuto la pagina vera!
             }
-        } catch (proxyErr) {
-            return null;
+        } catch (err) {
+            // Se c'è un errore (es. 403 Forbidden), passiamo silenziosamente al prossimo proxy
+            continue; 
         }
     }
-    return null;
+    return null; // Tutti i tentativi hanno fallito
 }
 
-// Interroga l'API di Yahoo (che non blocca mai i server se ha gli headers giusti)
 async function getYahooPrice(ticker) {
     try {
         const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1d`;
@@ -83,7 +90,6 @@ app.get('/api/price', async (req, res) => {
     const { ticker, isin } = req.query;
     let logs = []; 
 
-    // 1. YAHOO TRAMITE TICKER
     if (ticker) {
         const price = await getYahooPrice(ticker);
         if (price) return res.json({ price, source: 'Yahoo Finance (Ticker)' });
@@ -93,13 +99,11 @@ app.get('/api/price', async (req, res) => {
     if (isin) {
         const cleanIsin = isin.trim().toUpperCase();
 
-        // 2A. TRADUZIONE ISIN -> YAHOO
         try {
             const searchUrl = `https://query2.finance.yahoo.com/v1/finance/search?q=${cleanIsin}`;
-            // Aggiunti gli header obbligatori per evitare il blocco 403 di Yahoo
             const searchRes = await axios.get(searchUrl, { headers: defaultHeaders, timeout: 5000 });
             if (searchRes.data.quotes && searchRes.data.quotes.length > 0) {
-                const validQuote = searchRes.data.quotes.find(q => q.quoteType === 'EQUITY' || q.quoteType === 'ETF') || searchRes.data.quotes[0];
+                const validQuote = searchRes.data.quotes.find(q => q.quoteType === 'EQUITY' || q.quoteType === 'ETF' || q.quoteType === 'MUTUALFUND') || searchRes.data.quotes[0];
                 if (validQuote && validQuote.symbol) {
                     const price = await getYahooPrice(validQuote.symbol);
                     if (price) return res.json({ price, source: `Yahoo Finance (${validQuote.symbol})` });
@@ -109,7 +113,6 @@ app.get('/api/price', async (req, res) => {
             logs.push('Traduzione Yahoo ISIN fallita');
         }
 
-        // 2B. JUSTETF (Scansione Visiva + Scansione Segugio)
         try {
             const html = await fetchHtml(`https://www.justetf.com/it/etf-profile.html?isin=${cleanIsin}`);
             if (html) {
@@ -119,14 +122,12 @@ app.get('/api/price', async (req, res) => {
                 
                 if (!isNaN(price) && price > 0) return res.json({ price, source: 'JustETF (HTML)' });
 
-                // Passaggio del Segugio nel codice grezzo
                 price = extractPriceRegex(html);
                 if (price) return res.json({ price, source: 'JustETF (Codice Nascosto)' });
             }
-            logs.push('Prezzo non trovato su JustETF');
+            logs.push('Prezzo non trovato su JustETF (Blocco Anti-Bot in corso)');
         } catch(e) { logs.push('JustETF fallito'); }
 
-        // 2C. BORSA ITALIANA
         try {
             const html = await fetchHtml(`https://www.borsaitaliana.it/borsa/ricerca/dettaglio.html?isin=${cleanIsin}`);
             if (html) {
@@ -143,10 +144,9 @@ app.get('/api/price', async (req, res) => {
                 price = extractPriceRegex(html);
                 if (price) return res.json({ price, source: 'Borsa Italiana (Codice Nascosto)' });
             }
-            logs.push('Prezzo non trovato su Borsa Italiana');
+            logs.push('Prezzo non trovato su Borsa Italiana (Blocco Anti-Bot in corso)');
         } catch(e) { logs.push('Borsa Italiana fallita'); }
 
-        // 2D. TELEBORSA (Ottimo Paracadute per ETF e BTP)
         try {
             const html = await fetchHtml(`https://www.teleborsa.it/Quotazioni/Ricerca?q=${cleanIsin}`);
             if (html) {
@@ -162,10 +162,9 @@ app.get('/api/price', async (req, res) => {
                 price = extractPriceRegex(html);
                 if (price) return res.json({ price, source: 'Teleborsa (Codice Nascosto)' });
             }
-            logs.push('Prezzo non trovato su Teleborsa');
+            logs.push('Prezzo non trovato su Teleborsa (Blocco Anti-Bot in corso)');
         } catch(e) { logs.push('Teleborsa fallita'); }
         
-        // 2E. MARKETS VONTOBEL (Certificati Vontobel)
         try {
             const html = await fetchHtml(`https://markets.vontobel.com/it-it/prodotti/ricerca?query=${cleanIsin}`);
             if (html) {
@@ -186,7 +185,6 @@ app.get('/api/price', async (req, res) => {
         } catch(e) { logs.push('Vontobel fallita'); }
     }
 
-    // Se arriviamo qui, il segugio non ce l'ha fatta su nessun sito
     res.status(404).json({ error: 'Prezzo non trovato con nessun metodo', logs });
 });
 
