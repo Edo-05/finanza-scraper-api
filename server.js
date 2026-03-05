@@ -10,6 +10,13 @@ app.use(cors());
 // FUNZIONI DI SUPPORTO E BYPASS SICUREZZA
 // --------------------------------------------------------
 
+// Headers globali per simulare un browser reale (FONDAMENTALE per non farsi bloccare da Yahoo e altri)
+const defaultHeaders = { 
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7'
+};
+
 // Pulisce testi complessi (es. "€ 1.234,56", "1,234.56 EUR") in numero puro (1234.56)
 function parseEuroPrice(text) {
     if (!text) return NaN;
@@ -39,18 +46,13 @@ function extractPriceRegex(html) {
 
 // Funzione infallibile che prova la via diretta, e se bloccata usa un proxy
 async function fetchHtml(targetUrl) {
-    const headers = { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, come Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8'
-    };
     try {
-        const res = await axios.get(targetUrl, { headers, timeout: 6000 });
+        const res = await axios.get(targetUrl, { headers: defaultHeaders, timeout: 6000 });
         return res.data;
     } catch (err) {
         try {
             const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
-            const proxyRes = await axios.get(proxyUrl, { headers, timeout: 8000 });
+            const proxyRes = await axios.get(proxyUrl, { headers: defaultHeaders, timeout: 8000 });
             if (proxyRes.data && proxyRes.data.contents) {
                 return proxyRes.data.contents;
             }
@@ -61,11 +63,11 @@ async function fetchHtml(targetUrl) {
     return null;
 }
 
-// Interroga l'API di Yahoo (che non blocca mai i server)
+// Interroga l'API di Yahoo (che non blocca mai i server se ha gli headers giusti)
 async function getYahooPrice(ticker) {
     try {
         const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1d`;
-        const { data } = await axios.get(yUrl, { timeout: 5000 });
+        const { data } = await axios.get(yUrl, { headers: defaultHeaders, timeout: 5000 });
         if (data.chart.result && data.chart.result.length > 0) {
             return data.chart.result[0].meta.regularMarketPrice;
         }
@@ -94,7 +96,8 @@ app.get('/api/price', async (req, res) => {
         // 2A. TRADUZIONE ISIN -> YAHOO
         try {
             const searchUrl = `https://query2.finance.yahoo.com/v1/finance/search?q=${cleanIsin}`;
-            const searchRes = await axios.get(searchUrl, { timeout: 5000 });
+            // Aggiunti gli header obbligatori per evitare il blocco 403 di Yahoo
+            const searchRes = await axios.get(searchUrl, { headers: defaultHeaders, timeout: 5000 });
             if (searchRes.data.quotes && searchRes.data.quotes.length > 0) {
                 const validQuote = searchRes.data.quotes.find(q => q.quoteType === 'EQUITY' || q.quoteType === 'ETF') || searchRes.data.quotes[0];
                 if (validQuote && validQuote.symbol) {
@@ -143,7 +146,7 @@ app.get('/api/price', async (req, res) => {
             logs.push('Prezzo non trovato su Borsa Italiana');
         } catch(e) { logs.push('Borsa Italiana fallita'); }
 
-        // 2D. TELEBORSA (Ottimo Paracadute)
+        // 2D. TELEBORSA (Ottimo Paracadute per ETF e BTP)
         try {
             const html = await fetchHtml(`https://www.teleborsa.it/Quotazioni/Ricerca?q=${cleanIsin}`);
             if (html) {
