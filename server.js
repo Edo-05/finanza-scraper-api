@@ -29,11 +29,29 @@ function parseEuroPrice(text) {
     return parseFloat(cleaned);
 }
 
+// FUNZIONE SCUDO: Usa un proxy per nascondere l'identità del server Render ed evitare blocchi IP
+async function fetchProxied(url, isJson = true) {
+    try {
+        const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+        const response = await axios.get(proxyUrl, { timeout: 10000 });
+        if (response.data && response.data.contents) {
+            if (isJson) {
+                return JSON.parse(response.data.contents);
+            } else {
+                return response.data.contents;
+            }
+        }
+    } catch (e) {
+        console.error("Errore proxy per", url);
+    }
+    return null;
+}
+
 app.get('/api/price', async (req, res) => {
     const { ticker, isin } = req.query;
     let logs = []; 
 
-    // 1. YAHOO TRAMITE TICKER
+    // 1. YAHOO TRAMITE TICKER (Non necessita di proxy)
     if (ticker) {
         try {
             const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1d`;
@@ -65,42 +83,57 @@ app.get('/api/price', async (req, res) => {
             }
         } catch (e) { logs.push('Yahoo ISIN fallito'); }
 
-        // 2B. FINANCIAL TIMES API (Il Re dei BTP, Fondi Comuni e ETF Europei)
+        // 2B. FINANCIAL TIMES API (Il Re dei BTP, Fondi Comuni e ETF Europei) TRAMITE PROXY
         try {
             const ftSearchUrl = `https://markets.ft.com/data/searchapi/search?query=${cleanIsin}`;
-            const ftSearchRes = await axios.get(ftSearchUrl, { headers: defaultHeaders, timeout: 5000 });
-            if (ftSearchRes.data && ftSearchRes.data.data && ftSearchRes.data.data.searchResults && ftSearchRes.data.data.searchResults.length > 0) {
-                const ftSymbol = ftSearchRes.data.data.searchResults[0].symbol;
+            const searchData = await fetchProxied(ftSearchUrl, true);
+            if (searchData && searchData.data && searchData.data.searchResults && searchData.data.searchResults.length > 0) {
+                const ftSymbol = searchData.data.searchResults[0].symbol;
                 const ftQuoteUrl = `https://markets.ft.com/data/extapi/quotes?symbols=${ftSymbol}`;
-                const ftQuoteRes = await axios.get(ftQuoteUrl, { headers: defaultHeaders, timeout: 5000 });
-                if (ftQuoteRes.data && ftQuoteRes.data.length > 0) {
-                    const price = ftQuoteRes.data[0].lastPrice;
+                const quoteData = await fetchProxied(ftQuoteUrl, true);
+                if (quoteData && quoteData.length > 0) {
+                    const price = quoteData[0].lastPrice;
                     if (price) return res.json({ price: parseFloat(price), source: 'Financial Times API' });
                 }
             }
         } catch(e) { logs.push('Financial Times fallito'); }
 
-        // 2C. TRADEGATE EXCHANGE (Perfetto per Certificati Vontobel e Azioni Miste)
+        // 2C. TRADEGATE EXCHANGE TRAMITE PROXY
         try {
-            // Sito della borsa tedesca privo di Cloudflare
             const tgUrl = `https://www.tradegate.de/refresh.php?isin=${cleanIsin}`;
-            const tgRes = await axios.get(tgUrl, { headers: defaultHeaders, timeout: 5000 });
-            const match = tgRes.data.match(/<td id="last">([\d,.]+)<\/td>/i);
-            if (match && match[1]) {
-                const price = parseEuroPrice(match[1]);
-                if (!isNaN(price) && price > 0) return res.json({ price, source: 'Tradegate Exchange' });
+            const html = await fetchProxied(tgUrl, false);
+            if (html) {
+                const match = html.match(/<td id="last">([\d,.]+)<\/td>/i);
+                if (match && match[1]) {
+                    const price = parseEuroPrice(match[1]);
+                    if (!isNaN(price) && price > 0) return res.json({ price, source: 'Tradegate Exchange' });
+                }
             }
         } catch(e) { logs.push('Tradegate fallito'); }
 
-        // 2D. IL SOLE 24 ORE API (Borsa Italiana Pura)
+        // 2D. IL SOLE 24 ORE API TRAMITE PROXY
         try {
             const soleUrl = `https://mercati.ilsole24ore.com/api/proxy/dati/strumento?isin=${cleanIsin}`;
-            const soleRes = await axios.get(soleUrl, { headers: defaultHeaders, timeout: 5000 });
-            if (soleRes.data && soleRes.data.Prezzo) {
-                const price = parseEuroPrice(soleRes.data.Prezzo);
+            const soleData = await fetchProxied(soleUrl, true);
+            if (soleData && soleData.Prezzo) {
+                const price = parseEuroPrice(soleData.Prezzo);
                 if (!isNaN(price) && price > 0) return res.json({ price, source: 'Il Sole 24 Ore API' });
             }
         } catch(e) { logs.push('Sole 24 Ore fallito'); }
+        
+        // 2E. JUSTETF TRAMITE PROXY (HTML)
+        try {
+            const jUrl = `https://www.justetf.com/it/etf-profile.html?isin=${cleanIsin}`;
+            const html = await fetchProxied(jUrl, false);
+            if (html) {
+                // Estrae il prezzo cercando il tag HTML specifico
+                const match = html.match(/<div[^>]*class="[^"]*val[^"]*"[^>]*>[\s\S]*?<span[^>]*>([\d,.]+)<\/span>/i);
+                if (match && match[1]) {
+                    const price = parseEuroPrice(match[1]);
+                    if (!isNaN(price) && price > 0) return res.json({ price, source: 'JustETF' });
+                }
+            }
+        } catch(e) { logs.push('JustETF fallito'); }
     }
 
     // Se arriviamo qui... l'asset è davvero introvabile!
